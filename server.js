@@ -237,6 +237,7 @@ async function duckChat(model, userText) {
   await ensureBrowser();
   page = await newPage();
   console.log("[page] new page created");
+  try {
   await sleep(2000);
   if (await dismissConsent()) console.log("[consent] dismissed on load");
   if (await hasCaptcha()) { console.log("[captcha] detected on load, solving"); await solveCaptcha(); }
@@ -245,15 +246,27 @@ async function duckChat(model, userText) {
     const tas = Array.from(document.querySelectorAll("textarea")).filter((t) => t.offsetParent !== null);
     return tas[0] || document.querySelector("textarea");
   });
-  const taEl = taHandle.asElement();
-  if (taEl) {
-    const bb = await taEl.boundingBox();
-    if (bb) await pclick(bb.x + bb.width / 2, bb.y + bb.height / 2);
-    await taEl.click({ clickCount: 3 }).catch(() => {});
-    await page.keyboard.press("Backspace");
+  // Set the prompt instantly via the native value setter + input event.
+  // Char-by-char page.type() is O(n^2) in React textareas and hangs on huge prompts.
+  const setOk = await peval((text) => {
+    const ta = Array.from(document.querySelectorAll("textarea")).filter((t) => t.offsetParent !== null)[0] || document.querySelector("textarea");
+    if (!ta) return false;
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+    setter.call(ta, text);
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
+    return ta.value.length > 0;
+  }, userText).catch(() => false);
+  if (!setOk) {
+    // Fallback: focus and type (slow path) only if the instant set failed.
+    const taEl = taHandle.asElement();
+    if (taEl) {
+      const bb = await taEl.boundingBox();
+      if (bb) await pclick(bb.x + bb.width / 2, bb.y + bb.height / 2);
+      await taEl.click({ clickCount: 3 }).catch(() => {});
+      await page.keyboard.press("Backspace");
+      await withTimeout(taEl.type(userText, { delay: 1 }), 120000, "type");
+    }
   }
-  // Type with a low per-char delay; long prompts are bounded by the request timeout.
-  await withTimeout(taEl.type(userText, { delay: 1 }), 120000, "type");
   if (await dismissConsent()) console.log("[consent] dismissed before submit");
   let box = null;
   for (let i = 0; i < 30; i++) {
@@ -298,6 +311,10 @@ async function duckChat(model, userText) {
     if (text) { result = text; break; }
   }
   return result;
+  } finally {
+    try { if (page) await page.close(); } catch (e) {}
+    page = null;
+  }
 }
 
 const server = http.createServer(async (req, res) => {
