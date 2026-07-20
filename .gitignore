@@ -1,0 +1,8 @@
+node_modules/
+npm-debug.log*
+logs/
+*.log
+/tmp/cap_*.png
+.DS_Store
+.idea/
+.vscode/

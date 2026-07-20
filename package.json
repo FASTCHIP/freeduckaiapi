@@ -1,0 +1,17 @@
+{
+  "name": "freeduckaiapi",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible proxy to Duck.ai with automatic CAPTCHA solving via a local vision-language model",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "puppeteer": "^24.0.0"
+  },
+  "license": "MIT"
+}

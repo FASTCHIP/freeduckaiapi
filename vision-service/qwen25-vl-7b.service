@@ -1,0 +1,16 @@
+[Unit]
+Description=qwen25-vl-7b vision server (llama.cpp) — CAPTCHA eyes for freeduckaiapi
+After=network.target
+
+[Service]
+Type=simple
+User=fastchip
+Group=fastchip
+WorkingDirectory=/srv/llama
+ExecStart=/usr/local/bin/llama-server --host 0.0.0.0 --port 8084 --model /srv/llama/models/vision/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf --mmproj /srv/llama/models/vision/mmproj-F16.gguf --alias qwen25-vl-7b --ctx-size 32768 --cache-type-k q8_0 --cache-type-v q8_0 --threads 16 --threads-batch 16 --batch-size 2048 --ubatch-size 512 --parallel 1 --cont-batching --jinja --flash-attn on --cache-prompt
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

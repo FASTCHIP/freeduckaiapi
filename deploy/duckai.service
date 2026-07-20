@@ -1,0 +1,19 @@
+[Unit]
+Description=freeduckaiapi — Duck.ai OpenAI-compatible proxy (browser-based, CAPTCHA-solving)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/duckai-browser
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=node /opt/duckai-browser/server.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=CHROME_PATH=/opt/chrome/chrome-linux64/chrome
+Environment=VL_URL=http://localhost:8084/v1/chat/completions
+Environment=VL_MODEL=qwen25-vl-7b
+
+[Install]
+WantedBy=multi-user.target
