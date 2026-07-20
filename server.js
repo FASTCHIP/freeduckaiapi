@@ -6,6 +6,9 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
 const CHROME = process.env.CHROME_PATH || "/opt/chrome/chrome-linux64/chrome";
 const VL_URL = process.env.VL_URL || "http://localhost:8084/v1/chat/completions";
 const VL_MODEL = process.env.VL_MODEL || "qwen25-vl-7b";
+// Hard ceiling for a single request (ms). Guarantees the mutex is released.
+const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || "175000", 10);
+const EVAL_TIMEOUT = parseInt(process.env.EVAL_TIMEOUT || "30000", 10);
 
 // Models exposed through the OpenAI-compatible API, mapped to their Duck.ai UI labels.
 const MODELS = [
@@ -23,6 +26,15 @@ const MODEL_UI = {
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Race a promise against a timeout so a hung browser cannot wedge the proxy forever.
+function withTimeout(promise, ms, label) {
+  let timer;
+  const guarded = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error("timeout:" + label)), ms);
+  });
+  return Promise.race([promise, guarded]).finally(() => clearTimeout(timer));
+}
 
 let browser = null, page = null, busy = false;
 
@@ -47,10 +59,15 @@ async function newPage() {
   return p;
 }
 
+// Timeout-wrapped page helpers.
+const peval = (fn, ...args) => withTimeout(page.evaluate(fn, ...args), EVAL_TIMEOUT, "evaluate");
+const pevalHandle = (fn, ...args) => withTimeout(page.evaluateHandle(fn, ...args), EVAL_TIMEOUT, "evaluateHandle");
+const pclick = (x, y) => withTimeout(page.mouse.click(x, y), EVAL_TIMEOUT, "click");
+
 async function selectModel(model) {
   const ui = MODEL_UI[model];
   if (!ui) { console.log("[model] unknown model, using current selection"); return; }
-  const clicked = await page.evaluate(() => {
+  const clicked = await peval(() => {
     const ta = document.querySelector("textarea");
     const tar = ta.getBoundingClientRect();
     let sel = Array.from(document.querySelectorAll("button")).find((b) => {
@@ -69,7 +86,7 @@ async function selectModel(model) {
     return null;
   });
   await sleep(1000);
-  const picked = await page.evaluate((target) => {
+  const picked = await peval((target) => {
     const opts = Array.from(document.querySelectorAll("button"));
     const matches = opts.filter((b) => {
       const t = (b.textContent || "").trim().toLowerCase();
@@ -86,7 +103,7 @@ async function selectModel(model) {
 }
 
 async function getTiles() {
-  return await page.evaluate(() => {
+  return await peval(() => {
     const all = Array.from(document.querySelectorAll("div, button, span"));
     for (const el of all) {
       const kids = Array.from(el.children).filter((k) => {
@@ -124,7 +141,7 @@ async function solveCaptcha() {
         continue;
       } catch (e) { console.log("[captcha] dl fail", t.url, e.message); }
     }
-    const b = await page.evaluate((i) => {
+    const b = await peval((i) => {
       const el = document.querySelector(`[data-index="${i}"]`);
       const r = el.getBoundingClientRect();
       return { x: r.x, y: r.y, width: r.width, height: r.height };
@@ -142,10 +159,10 @@ async function solveCaptcha() {
   console.log("[captcha] vision:", answer);
   const idxs = answer === "NONE" ? [] : answer.split(/[,\s]+/).map((s) => parseInt(s, 10) - 1).filter((n) => n >= 0 && n < tiles.length);
   for (const idx of idxs) {
-    await page.evaluate((i) => { const t = document.querySelector(`[data-index="${i}"]`); if (t) t.click(); }, idx);
+    await peval((i) => { const t = document.querySelector(`[data-index="${i}"]`); if (t) t.click(); }, idx);
     await sleep(250);
   }
-  await page.evaluate(() => {
+  await peval(() => {
     const b = Array.from(document.querySelectorAll("button")).find((x) => (x.textContent || "").trim().toLowerCase() === "submit");
     if (b) b.click();
   });
@@ -154,11 +171,11 @@ async function solveCaptcha() {
 }
 
 async function hasCaptcha() {
-  return await page.evaluate(() => document.body.innerText.includes("Select all squares"));
+  return await peval(() => document.body.innerText.includes("Select all squares"));
 }
 
 async function dismissConsent() {
-  return await page.evaluate(() => {
+  return await peval(() => {
     const b = Array.from(document.querySelectorAll("button")).find((x) => /agree and continue/i.test(x.textContent || "") && x.offsetParent !== null);
     if (b) { b.click(); return "agree"; }
     const c = Array.from(document.querySelectorAll("button")).find((x) => /^\s*continue\s*$/i.test(x.textContent || "") && x.offsetParent !== null);
@@ -168,7 +185,7 @@ async function dismissConsent() {
 }
 
 async function extractAnswer(userPrompt) {
-  return await page.evaluate((prompt) => {
+  return await peval((prompt) => {
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
     const p = norm(prompt);
     const els = Array.from(document.querySelectorAll("*")).filter((e) => {
@@ -224,22 +241,23 @@ async function duckChat(model, userText) {
   if (await dismissConsent()) console.log("[consent] dismissed on load");
   if (await hasCaptcha()) { console.log("[captcha] detected on load, solving"); await solveCaptcha(); }
   await selectModel(model);
-  const taHandle = await page.evaluateHandle(() => {
+  const taHandle = await pevalHandle(() => {
     const tas = Array.from(document.querySelectorAll("textarea")).filter((t) => t.offsetParent !== null);
     return tas[0] || document.querySelector("textarea");
   });
   const taEl = taHandle.asElement();
   if (taEl) {
     const bb = await taEl.boundingBox();
-    if (bb) await page.mouse.click(bb.x + bb.width / 2, bb.y + bb.height / 2);
+    if (bb) await pclick(bb.x + bb.width / 2, bb.y + bb.height / 2);
     await taEl.click({ clickCount: 3 }).catch(() => {});
     await page.keyboard.press("Backspace");
   }
-  await taEl.type(userText, { delay: 10 });
+  // Type with a low per-char delay; long prompts are bounded by the request timeout.
+  await withTimeout(taEl.type(userText, { delay: 1 }), 120000, "type");
   if (await dismissConsent()) console.log("[consent] dismissed before submit");
   let box = null;
   for (let i = 0; i < 30; i++) {
-    box = await page.evaluate(() => {
+    box = await peval(() => {
       const els = Array.from(document.querySelectorAll("button, [role='button']"));
       const isSubmit = (b) => {
         const t = (b.textContent || "").trim().toLowerCase();
@@ -254,19 +272,18 @@ async function duckChat(model, userText) {
     await sleep(500);
   }
   if (!box) {
-    const diag = await page.evaluate(() => {
+    const diag = await peval(() => {
       const ta = Array.from(document.querySelectorAll("textarea")).filter((t) => t.offsetParent !== null)[0] || document.querySelector("textarea");
       const tar = ta ? ta.getBoundingClientRect() : null;
       const els = Array.from(document.querySelectorAll("button, [role='button']"));
       const near = els.filter((b) => { const r = b.getBoundingClientRect(); return tar && Math.abs(r.y - tar.y) < 120; }).map((b) => ({ text: (b.textContent || "").trim().slice(0, 30), aria: b.getAttribute("aria-label") }));
       return { near, taCount: document.querySelectorAll("textarea").length, taVal: ta ? ta.value.slice(0, 30) : "NONE" };
-    });
+    }).catch(() => null);
     console.log("[chat] submit button not found. DIAG:", JSON.stringify(diag));
-    try { await page.close(); } catch (e) {}
     return "";
   }
-  await page.mouse.click(box.x, box.y);
-  console.log("[chat] submitted:", userText.slice(0, 40));
+  await pclick(box.x, box.y);
+  console.log("[chat] submitted:", userText.slice(0, 60));
 
   const deadline = Date.now() + 160000;
   let result = "";
@@ -280,7 +297,6 @@ async function duckChat(model, userText) {
     if (captcha) { await solveCaptcha(); continue; }
     if (text) { result = text; break; }
   }
-  try { await page.close(); } catch (e) {}
   return result;
 }
 
@@ -315,8 +331,15 @@ const server = http.createServer(async (req, res) => {
           return res.end(JSON.stringify({ error: { message: "busy", type: "rate_limit" } }));
         }
         busy = true;
-        const answer = await duckChat(model, userText);
-        busy = false;
+        let answer;
+        try {
+          answer = await withTimeout(duckChat(model, userText), REQUEST_TIMEOUT, "request");
+        } catch (e) {
+          console.error("[request-timeout]", e.message);
+          answer = "";
+        } finally {
+          busy = false;
+        }
         const out = {
           id: "chatcmpl-" + Math.random().toString(36).slice(2, 15),
           object: "chat.completion",
